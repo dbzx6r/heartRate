@@ -33,6 +33,9 @@ int beatAvg = 0;
 void setup() {
   Serial.begin(115200);
 
+  // Explicitly initialise I2C with ESP32 default pins before any peripheral
+  Wire.begin(21, 22);
+
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println(F("SSD1306 allocation failed"));
     for (;;);
@@ -46,14 +49,19 @@ void setup() {
   display.println(F("Initializing..."));
   display.display();
 
+  // Try fast speed first, fall back to standard if the sensor isn't found
   if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println(F("MAX30102 not found. Check wiring."));
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println(F("MAX30102 not found!"));
-    display.println(F("Check wiring."));
-    display.display();
-    for (;;);
+    Serial.println(F("Fast I2C failed, retrying at standard speed..."));
+    Wire.begin(21, 22);
+    if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+      Serial.println(F("MAX30102 not found. Check wiring."));
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println(F("MAX30102 not found!"));
+      display.println(F("Check wiring."));
+      display.display();
+      for (;;);
+    }
   }
 
   particleSensor.setup();
