@@ -29,11 +29,19 @@ byte rateSpot = 0;
 long lastBeat = 0;
 float beatsPerMinute = 0;
 int beatAvg = 0;
+bool sensorReady = false;
+
+bool initSensor() {
+  Wire.begin(21, 22);
+  if (particleSensor.begin(Wire, I2C_SPEED_FAST)) return true;
+  Serial.println(F("Fast I2C failed, retrying at standard speed..."));
+  Wire.begin(21, 22);
+  return particleSensor.begin(Wire, I2C_SPEED_STANDARD);
+}
 
 void setup() {
   Serial.begin(115200);
 
-  // Explicitly initialise I2C with ESP32 default pins before any peripheral
   Wire.begin(21, 22);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
@@ -41,37 +49,45 @@ void setup() {
     for (;;);
   }
 
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(F("Heart Rate Monitor"));
-  display.println(F("Initializing..."));
-  display.display();
-
-  // Try fast speed first, fall back to standard if the sensor isn't found
-  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println(F("Fast I2C failed, retrying at standard speed..."));
-    Wire.begin(21, 22);
-    if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-      Serial.println(F("MAX30102 not found. Check wiring."));
-      display.clearDisplay();
-      display.setCursor(0, 0);
-      display.println(F("MAX30102 not found!"));
-      display.println(F("Check wiring."));
-      display.display();
-      for (;;);
-    }
+  // Attempt first sensor init; if it fails, loop() will keep retrying
+  if (initSensor()) {
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x0A);
+    particleSensor.setPulseAmplitudeGreen(0);
+    sensorReady = true;
   }
-
-  particleSensor.setup();
-  particleSensor.setPulseAmplitudeRed(0x0A);
-  particleSensor.setPulseAmplitudeGreen(0);
-
-  delay(1000);
 }
 
 void loop() {
+  // Retry sensor init every 2 seconds until found
+  if (!sensorReady) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println(F("Heart Rate Monitor"));
+    display.drawLine(0, 10, SCREEN_WIDTH - 1, 10, SSD1306_WHITE);
+    display.setCursor(10, 25);
+    display.println(F("Sensor not found."));
+    display.setCursor(10, 40);
+    display.println(F("Check wiring..."));
+    display.display();
+    delay(2000);
+
+    if (initSensor()) {
+      particleSensor.setup();
+      particleSensor.setPulseAmplitudeRed(0x0A);
+      particleSensor.setPulseAmplitudeGreen(0);
+      // Reset BPM state on fresh connect
+      rateSpot = 0;
+      beatsPerMinute = 0;
+      beatAvg = 0;
+      memset(rates, 0, sizeof(rates));
+      sensorReady = true;
+    }
+    return;
+  }
+
   long irValue = particleSensor.getIR();
 
   if (checkForBeat(irValue)) {
