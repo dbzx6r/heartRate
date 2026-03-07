@@ -51,8 +51,9 @@ void setup() {
 
   // Attempt first sensor init; if it fails, loop() will keep retrying
   if (initSensor()) {
-    particleSensor.setup();
-    particleSensor.setPulseAmplitudeRed(0x0A);
+    particleSensor.setup(0x1F, 4, 2, 400, 411, 4096);
+    particleSensor.setPulseAmplitudeRed(0x1F);
+    particleSensor.setPulseAmplitudeIR(0x1F);
     particleSensor.setPulseAmplitudeGreen(0);
     sensorReady = true;
   }
@@ -75,8 +76,9 @@ void loop() {
     delay(2000);
 
     if (initSensor()) {
-      particleSensor.setup();
-      particleSensor.setPulseAmplitudeRed(0x0A);
+      particleSensor.setup(0x1F, 4, 2, 400, 411, 4096);
+      particleSensor.setPulseAmplitudeRed(0x1F);
+      particleSensor.setPulseAmplitudeIR(0x1F);
       particleSensor.setPulseAmplitudeGreen(0);
       // Reset BPM state on fresh connect
       rateSpot = 0;
@@ -116,7 +118,7 @@ void loop() {
   display.println(F("Heart Rate Monitor"));
   display.drawLine(0, 10, SCREEN_WIDTH - 1, 10, SSD1306_WHITE);
 
-  if (irValue < 50000) {
+  if (irValue < 7000) {
     display.setCursor(10, 22);
     display.setTextSize(1);
     display.println(F("No finger detected."));
