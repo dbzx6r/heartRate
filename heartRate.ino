@@ -3,11 +3,11 @@
   Hardware: ESP32 + MAX30102 + SSD1306 (128x64)
   Both MAX30102 and SSD1306 share the I2C bus on GPIO 21 (SDA) / GPIO 22 (SCL)
 
-  The MAX30102 is a PPG (photoplethysmography) sensor — it measures blood
-  volume changes via reflected IR light. The raw signal is a smooth sine-like
-  wave, NOT the sharp QRS spikes of an ECG. To get the classic hospital-monitor
-  look, we synthesize an ECG-like PQRST waveform triggered by the library's
-  beat detector.
+  The MAX30102 is a PPG sensor. The raw IR signal drops when the heart beats
+  (more blood → more light absorbed → lower reading). We apply a DC-removal
+  high-pass filter, smooth with a moving average, invert the result, and
+  auto-scale per-frame so the waveform always fills the display — matching
+  the approach used by well-known open-source pulse oximeter projects.
 
   Libraries required:
     - SparkFun MAX3010x Pulse and Proximity Sensor Library
@@ -26,11 +26,9 @@
 #define OLED_RESET    -1
 #define SCREEN_ADDRESS 0x3C
 
-// Waveform display area
 #define WAVE_Y_START  12
 #define WAVE_HEIGHT   38
 #define WAVE_Y_END    (WAVE_Y_START + WAVE_HEIGHT)
-#define BASELINE      (WAVE_HEIGHT - 4)  // baseline near the bottom of the wave area
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 MAX30105 particleSensor;
@@ -44,46 +42,26 @@ int beatAvg = 0;
 byte samplesCollected = 0;
 bool sensorReady = false;
 
-// Scrolling waveform buffer (one Y-offset per pixel column, 0=top, WAVE_HEIGHT-1=bottom)
-uint8_t waveBuffer[SCREEN_WIDTH];
+// --- Signal processing ---
+// DC removal high-pass filter state
+float dcW = 0;        // filter memory
+#define DC_ALPHA 0.95f // high-pass cutoff ~0.5 Hz at 50 sps — passes heartbeat, blocks DC drift
 
-// Synthetic ECG PQRST waveform template.
-// Values are Y-offsets from top of wave area; BASELINE = resting line.
-// Pattern: flat → small P bump → flat → sharp QRS spike → dip below baseline → gentle T wave → flat
-#define ECG_LEN 28
-const uint8_t ecgTemplate[ECG_LEN] PROGMEM = {
-  BASELINE,                         //  0  flat
-  BASELINE,                         //  1  flat
-  BASELINE - 3,                     //  2  P wave rise
-  BASELINE - 5,                     //  3  P wave peak
-  BASELINE - 3,                     //  4  P wave fall
-  BASELINE,                         //  5  flat (PR segment)
-  BASELINE,                         //  6  flat
-  BASELINE + 2,                     //  7  Q dip (small down)
-  BASELINE - 10,                    //  8  R upstroke
-  BASELINE - 28,                    //  9  R peak (big spike!)
-  BASELINE - 10,                    // 10  R downstroke
-  BASELINE + 3,                     // 11  S dip (below baseline)
-  BASELINE + 2,                     // 12  S recovery
-  BASELINE,                         // 13  flat (ST segment)
-  BASELINE,                         // 14  flat
-  BASELINE,                         // 15  flat
-  BASELINE - 2,                     // 16  T wave rise
-  BASELINE - 4,                     // 17  T wave
-  BASELINE - 6,                     // 18  T wave peak
-  BASELINE - 6,                     // 19  T wave peak
-  BASELINE - 4,                     // 20  T wave fall
-  BASELINE - 2,                     // 21  T wave fall
-  BASELINE,                         // 22  flat
-  BASELINE,                         // 23  flat
-  BASELINE,                         // 24  flat
-  BASELINE,                         // 25  flat
-  BASELINE,                         // 26  flat
-  BASELINE,                         // 27  flat
-};
+// Moving average filter for noise smoothing
+#define MA_SIZE 4
+int16_t maBuffer[MA_SIZE];
+uint8_t maIndex = 0;
+bool maFilled = false;
 
-// Index into the ECG template; -1 means idle (drawing flat baseline)
-int ecgIndex = -1;
+// Circular waveform buffer storing filtered+inverted values (raw int16 before display scaling)
+#define WAVE_BUF_SIZE SCREEN_WIDTH
+int16_t waveBuf[WAVE_BUF_SIZE];
+uint8_t waveWriteIdx = 0;
+bool waveFilled = false;    // true once the buffer has wrapped at least once
+
+// Warmup: skip the first N samples while the DC filter settles
+#define WARMUP_SAMPLES 50
+int warmupCount = 0;
 
 bool initSensor() {
   Wire.begin(21, 22);
@@ -93,21 +71,46 @@ bool initSensor() {
   return particleSensor.begin(Wire, I2C_SPEED_STANDARD);
 }
 
+// DC-removal high-pass filter.
+// Removes the large constant IR baseline so only the pulsatile AC component remains.
+int16_t dcRemove(long rawValue) {
+  float x = (float)rawValue;
+  float oldW = dcW;
+  dcW = x + DC_ALPHA * oldW;
+  return (int16_t)(dcW - oldW);
+}
+
+// Moving average filter — smooths high-frequency noise from the AC signal.
+int16_t maFilter(int16_t input) {
+  maBuffer[maIndex] = input;
+  maIndex = (maIndex + 1) % MA_SIZE;
+  if (!maFilled && maIndex == 0) maFilled = true;
+  int16_t count = maFilled ? MA_SIZE : maIndex;
+  if (count == 0) return input;
+  long sum = 0;
+  for (int i = 0; i < count; i++) sum += maBuffer[i];
+  return (int16_t)(sum / count);
+}
+
 void resetMeasurement() {
   rateSpot = 0;
   beatsPerMinute = 0;
   beatAvg = 0;
   samplesCollected = 0;
-  ecgIndex = -1;
-  memset(rates, 0, sizeof(rates));
-  memset(waveBuffer, BASELINE, sizeof(waveBuffer));
+  dcW = 0;
+  maIndex = 0;
+  maFilled = false;
+  memset(maBuffer, 0, sizeof(maBuffer));
+  memset(waveBuf, 0, sizeof(waveBuf));
+  waveWriteIdx = 0;
+  waveFilled = false;
+  warmupCount = 0;
 }
 
 void setup() {
   Serial.begin(115200);
 
   Wire.begin(21, 22);
-  memset(waveBuffer, BASELINE, sizeof(waveBuffer));
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println(F("SSD1306 allocation failed"));
@@ -115,9 +118,10 @@ void setup() {
   }
 
   if (initSensor()) {
-    particleSensor.setup(0x1F, 4, 2, 400, 411, 4096);
-    particleSensor.setPulseAmplitudeRed(0x1F);
-    particleSensor.setPulseAmplitudeIR(0x1F);
+    // Higher LED power (0x7F = 25.4mA) for stronger signal and more reliable beat detection
+    particleSensor.setup(0x7F, 4, 2, 400, 411, 4096);
+    particleSensor.setPulseAmplitudeRed(0x7F);
+    particleSensor.setPulseAmplitudeIR(0x7F);
     particleSensor.setPulseAmplitudeGreen(0);
     sensorReady = true;
   }
@@ -139,9 +143,9 @@ void loop() {
     delay(2000);
 
     if (initSensor()) {
-      particleSensor.setup(0x1F, 4, 2, 400, 411, 4096);
-      particleSensor.setPulseAmplitudeRed(0x1F);
-      particleSensor.setPulseAmplitudeIR(0x1F);
+      particleSensor.setup(0x7F, 4, 2, 400, 411, 4096);
+      particleSensor.setPulseAmplitudeRed(0x7F);
+      particleSensor.setPulseAmplitudeIR(0x7F);
       particleSensor.setPulseAmplitudeGreen(0);
       resetMeasurement();
       sensorReady = true;
@@ -151,7 +155,7 @@ void loop() {
 
   long irValue = particleSensor.getIR();
 
-  // Beat detection triggers the synthetic ECG waveform
+  // BPM calculation via SparkFun beat detector
   if (checkForBeat(irValue)) {
     long delta = millis() - lastBeat;
     lastBeat = millis();
@@ -167,21 +171,21 @@ void loop() {
       for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
       beatAvg /= RATE_SIZE;
     }
-
-    // Start playing the ECG template from the beginning
-    ecgIndex = 0;
   }
 
-  // Scroll the waveform buffer left by one pixel
-  memmove(waveBuffer, waveBuffer + 1, SCREEN_WIDTH - 1);
+  // --- Signal processing for waveform ---
+  int16_t dcFiltered = dcRemove(irValue);
+  int16_t smoothed = maFilter(dcFiltered);
+  // Invert: PPG drops during a heartbeat, inverting gives upward peaks
+  int16_t inverted = -smoothed;
 
-  // Push the next waveform value: ECG template if active, otherwise flat baseline
-  if (ecgIndex >= 0 && ecgIndex < ECG_LEN) {
-    waveBuffer[SCREEN_WIDTH - 1] = pgm_read_byte(&ecgTemplate[ecgIndex]);
-    ecgIndex++;
-    if (ecgIndex >= ECG_LEN) ecgIndex = -1;  // done, back to flat
+  // Let the DC filter settle before recording to the wave buffer
+  if (warmupCount < WARMUP_SAMPLES) {
+    warmupCount++;
   } else {
-    waveBuffer[SCREEN_WIDTH - 1] = BASELINE;
+    waveBuf[waveWriteIdx] = inverted;
+    waveWriteIdx = (waveWriteIdx + 1) % WAVE_BUF_SIZE;
+    if (!waveFilled && waveWriteIdx == 0) waveFilled = true;
   }
 
   // --- Draw ---
@@ -200,12 +204,39 @@ void loop() {
     display.println(F("Place finger on"));
     display.setCursor(30, 50);
     display.println(F("sensor..."));
+  } else if (warmupCount < WARMUP_SAMPLES) {
+    display.setCursor(20, 28);
+    display.println(F("Calibrating..."));
   } else {
-    // Draw waveform as connected line segments
-    for (int x = 0; x < SCREEN_WIDTH - 1; x++) {
-      display.drawLine(x,     WAVE_Y_START + waveBuffer[x],
-                       x + 1, WAVE_Y_START + waveBuffer[x + 1],
-                       SSD1306_WHITE);
+    // Read the circular buffer in display order (oldest → newest, left → right)
+    int count = waveFilled ? WAVE_BUF_SIZE : waveWriteIdx;
+    if (count < 2) { display.display(); delay(20); return; }
+
+    // Per-frame auto-scaling: find min/max across the entire visible buffer
+    int16_t vMin = 32767, vMax = -32768;
+    for (int i = 0; i < count; i++) {
+      int idx = waveFilled ? (waveWriteIdx + i) % WAVE_BUF_SIZE : i;
+      if (waveBuf[idx] < vMin) vMin = waveBuf[idx];
+      if (waveBuf[idx] > vMax) vMax = waveBuf[idx];
+    }
+
+    int16_t range = vMax - vMin;
+    if (range < 10) range = 10;  // avoid divide-by-zero when signal is flat
+
+    // Map each sample to a display Y coordinate
+    int xOffset = SCREEN_WIDTH - count;  // right-justify if buffer not full yet
+    int prevY = -1;
+    for (int i = 0; i < count; i++) {
+      int idx = waveFilled ? (waveWriteIdx + i) % WAVE_BUF_SIZE : i;
+      // Scale to display: vMax→top (WAVE_Y_START), vMin→bottom (WAVE_Y_END-1)
+      int y = WAVE_Y_END - 1 - (int)((long)(waveBuf[idx] - vMin) * (WAVE_HEIGHT - 1) / range);
+      y = constrain(y, WAVE_Y_START, WAVE_Y_END - 1);
+
+      int x = xOffset + i;
+      if (prevY >= 0 && i > 0) {
+        display.drawLine(x - 1, prevY, x, y, SSD1306_WHITE);
+      }
+      prevY = y;
     }
 
     // Footer
