@@ -33,7 +33,7 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 MAX30105 particleSensor;
 
-const byte RATE_SIZE = 8;
+const byte RATE_SIZE = 4;
 byte rates[RATE_SIZE];
 byte rateSpot = 0;
 long lastBeat = 0;
@@ -77,8 +77,8 @@ void setup() {
   }
 
   if (initSensor()) {
-    // sampleAverage=8 for cleaner signal from cheap sensors
-    particleSensor.setup(0x1F, 8, 2, 400, 411, 4096);
+    // sampleAverage=1: checkForBeat() needs a fast raw stream to detect peaks
+    particleSensor.setup(0x1F, 1, 2, 400, 411, 4096);
     particleSensor.setPulseAmplitudeRed(0x1F);
     particleSensor.setPulseAmplitudeIR(0x1F);
     particleSensor.setPulseAmplitudeGreen(0);
@@ -102,7 +102,7 @@ void loop() {
     delay(2000);
 
     if (initSensor()) {
-      particleSensor.setup(0x1F, 8, 2, 400, 411, 4096);
+      particleSensor.setup(0x1F, 1, 2, 400, 411, 4096);
       particleSensor.setPulseAmplitudeRed(0x1F);
       particleSensor.setPulseAmplitudeIR(0x1F);
       particleSensor.setPulseAmplitudeGreen(0);
