@@ -17,7 +17,6 @@
 
 #include <Wire.h>
 #include "MAX30105.h"
-#include "heartRate.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -48,6 +47,45 @@ uint32_t rawBuf[WAVE_BUF_SIZE];
 uint8_t  bufWriteIdx = 0;
 bool     bufFilled = false;
 
+// Custom beat detector — works with cheap MAX30102 clones whose signals
+// are too weak for the SparkFun checkForBeat() thresholds.
+// Uses a slow EMA baseline + dynamic threshold on the inverted AC signal.
+float    bdBaseline = 0;
+float    bdPeak = 0;
+bool     bdAbove = false;
+long     bdLastBeat = 0;
+#define  BD_BASELINE_ALPHA  0.99f   // ~2s time constant — tracks drift, not beats
+#define  BD_PEAK_DECAY      0.995f  // peak amplitude decays slowly between beats
+#define  BD_MIN_INTERVAL    333     // ms — caps at ~180 BPM
+
+bool detectBeat(long irValue) {
+  if (bdBaseline == 0) { bdBaseline = (float)irValue; return false; }
+
+  bdBaseline = bdBaseline * BD_BASELINE_ALPHA + (float)irValue * (1.0f - BD_BASELINE_ALPHA);
+
+  // Inverted AC: positive when heart pumps (IR drops → inverted signal rises)
+  float ac = bdBaseline - (float)irValue;
+
+  // Track peak with slow decay so threshold adapts to signal strength
+  if (ac > bdPeak) bdPeak = ac;
+  else             bdPeak *= BD_PEAK_DECAY;
+
+  float threshold = bdPeak * 0.6f;
+  if (threshold < 20) return false;  // signal too weak, avoid false positives
+
+  long now = millis();
+  if (!bdAbove && ac > threshold) {
+    bdAbove = true;
+    if (now - bdLastBeat > BD_MIN_INTERVAL) {
+      bdLastBeat = now;
+      return true;  // rising edge past threshold = beat
+    }
+  } else if (ac < threshold * 0.3f) {
+    bdAbove = false;  // reset once signal falls well below threshold
+  }
+  return false;
+}
+
 bool initSensor() {
   Wire.begin(21, 22);
   if (particleSensor.begin(Wire, I2C_SPEED_FAST)) return true;
@@ -64,6 +102,10 @@ void resetMeasurement() {
   bufWriteIdx = 0;
   bufFilled = false;
   memset(rawBuf, 0, sizeof(rawBuf));
+  bdBaseline = 0;
+  bdPeak = 0;
+  bdAbove = false;
+  bdLastBeat = 0;
 }
 
 void setup() {
@@ -114,8 +156,8 @@ void loop() {
 
   long irValue = particleSensor.getIR();
 
-  // BPM calculation via SparkFun beat detector
-  if (checkForBeat(irValue)) {
+  // BPM calculation via custom beat detector (clone-sensor compatible)
+  if (detectBeat(irValue)) {
     long delta = millis() - lastBeat;
     lastBeat = millis();
 
