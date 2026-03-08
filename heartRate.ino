@@ -45,7 +45,6 @@ uint8_t waveBuffer[SCREEN_WIDTH];
 // AC min/max auto-scale the pulse amplitude to fill the waveform height.
 float irDC = 0;
 bool  dcInit = false;
-long  acMin = 0;
 long  acMax = 0;
 
 // Calibration warmup: run the EMA at fast alpha before drawing so the baseline
@@ -62,18 +61,16 @@ bool initSensor() {
 }
 
 // Maps a pre-computed AC value (irValue - irDC) into a waveform Y offset.
-// Auto-scales using a decaying AC min/max so the pulse fills the display.
+// Unipolar display: only positive peaks (systolic upstrokes) are scaled upward.
+// Negative values (between beats) clamp to the bottom, giving a flat baseline
+// with spikes — like a real pulse oximeter waveform.
 uint8_t acToWaveY(long ac) {
   if (ac > acMax) acMax = ac;
-  else            acMax = (long)(acMax * 0.999f);
+  else            acMax = (long)(acMax * 0.998f);  // slow decay so scale stays calibrated
 
-  if (ac < acMin) acMin = ac;
-  else            acMin = (long)(acMin * 0.999f);
+  if (acMax < 100) return WAVE_HEIGHT - 1;  // flat bottom until first beat detected
 
-  long range = acMax - acMin;
-  if (range < 50) return WAVE_HEIGHT / 2;
-
-  long mapped = map(ac, acMin, acMax, WAVE_HEIGHT - 1, 0);  // invert so peaks go up
+  long mapped = map(ac, 0, acMax, WAVE_HEIGHT - 1, 0);  // 0 → bottom, acMax → top
   return (uint8_t)constrain(mapped, 0, WAVE_HEIGHT - 1);
 }
 
@@ -87,7 +84,6 @@ void resetMeasurement() {
   irDC = 0;
   dcInit = false;
   dcWarmup = 0;
-  acMin = 0;
   acMax = 0;
 }
 
