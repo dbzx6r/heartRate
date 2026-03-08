@@ -41,9 +41,10 @@ bool sensorReady = false;
 // Scrolling waveform buffer (one Y value per pixel column)
 uint8_t waveBuffer[SCREEN_WIDTH];
 
-// Auto-scaling: tracks IR signal range to fill the waveform height
-long irMin = 200000;
-long irMax = 50000;
+// Auto-scaling: tracks IR signal range to fill the waveform height.
+// irMin starts high and irMax starts low so both get replaced on the first real reading.
+long irMin = 300000;
+long irMax = 0;
 
 bool initSensor() {
   Wire.begin(21, 22);
@@ -71,8 +72,8 @@ void resetMeasurement() {
   samplesCollected = 0;
   memset(rates, 0, sizeof(rates));
   memset(waveBuffer, WAVE_HEIGHT / 2, sizeof(waveBuffer));
-  irMin = 200000;
-  irMax = 50000;
+  irMin = 300000;
+  irMax = 0;
 }
 
 void setup() {
