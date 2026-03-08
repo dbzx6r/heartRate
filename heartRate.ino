@@ -47,44 +47,12 @@ uint32_t rawBuf[WAVE_BUF_SIZE];
 uint8_t  bufWriteIdx = 0;
 bool     bufFilled = false;
 
-// Custom beat detector — works with cheap MAX30102 clones whose signals
-// are too weak for the SparkFun checkForBeat() thresholds.
-// Uses a slow EMA baseline + dynamic threshold on the inverted AC signal.
-float    bdBaseline = 0;
-float    bdPeak = 0;
-bool     bdAbove = false;
-long     bdLastBeat = 0;
-#define  BD_BASELINE_ALPHA  0.99f   // ~2s time constant — tracks drift, not beats
-#define  BD_PEAK_DECAY      0.995f  // peak amplitude decays slowly between beats
-#define  BD_MIN_INTERVAL    333     // ms — caps at ~180 BPM
-
-bool detectBeat(long irValue) {
-  if (bdBaseline == 0) { bdBaseline = (float)irValue; return false; }
-
-  bdBaseline = bdBaseline * BD_BASELINE_ALPHA + (float)irValue * (1.0f - BD_BASELINE_ALPHA);
-
-  // Inverted AC: positive when heart pumps (IR drops → inverted signal rises)
-  float ac = bdBaseline - (float)irValue;
-
-  // Track peak with slow decay so threshold adapts to signal strength
-  if (ac > bdPeak) bdPeak = ac;
-  else             bdPeak *= BD_PEAK_DECAY;
-
-  float threshold = bdPeak * 0.6f;
-  if (threshold < 20) return false;  // signal too weak, avoid false positives
-
-  long now = millis();
-  if (!bdAbove && ac > threshold) {
-    bdAbove = true;
-    if (now - bdLastBeat > BD_MIN_INTERVAL) {
-      bdLastBeat = now;
-      return true;  // rising edge past threshold = beat
-    }
-  } else if (ac < threshold * 0.3f) {
-    bdAbove = false;  // reset once signal falls well below threshold
-  }
-  return false;
-}
+// Peak detector state — operates on the same inverted AC signal as the waveform
+long  pdPrevAC = 0;
+bool  pdRising = false;
+long  pdPeakVal = 0;
+long  pdLastBeat = 0;
+#define PD_MIN_INTERVAL 333  // ms, caps at ~180 BPM
 
 bool initSensor() {
   Wire.begin(21, 22);
@@ -102,10 +70,10 @@ void resetMeasurement() {
   bufWriteIdx = 0;
   bufFilled = false;
   memset(rawBuf, 0, sizeof(rawBuf));
-  bdBaseline = 0;
-  bdPeak = 0;
-  bdAbove = false;
-  bdLastBeat = 0;
+  pdPrevAC = 0;
+  pdRising = false;
+  pdPeakVal = 0;
+  pdLastBeat = 0;
 }
 
 void setup() {
@@ -156,22 +124,69 @@ void loop() {
 
   long irValue = particleSensor.getIR();
 
-  // BPM calculation via custom beat detector (clone-sensor compatible)
-  if (detectBeat(irValue)) {
-    long delta = millis() - lastBeat;
-    lastBeat = millis();
+  // Store raw IR in buffer first so the mean used for beat detection
+  // is identical to the mean used for drawing — if it shows on screen, it detects.
+  if (irValue >= 7000) {
+    rawBuf[bufWriteIdx] = (uint32_t)irValue;
+    bufWriteIdx = (bufWriteIdx + 1) % WAVE_BUF_SIZE;
+    if (!bufFilled && bufWriteIdx == 0) bufFilled = true;
+  }
 
-    beatsPerMinute = 60.0 / (delta / 1000.0);
+  int count = bufFilled ? WAVE_BUF_SIZE : bufWriteIdx;
 
-    if (beatsPerMinute > 20 && beatsPerMinute < 255) {
-      rates[rateSpot++] = (byte)beatsPerMinute;
-      rateSpot %= RATE_SIZE;
-      if (samplesCollected < RATE_SIZE) samplesCollected++;
-
-      beatAvg = 0;
-      for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
-      beatAvg /= RATE_SIZE;
+  // Beat detection: find peaks in the same inverted AC signal the waveform shows.
+  // We need at least half a buffer to have a stable mean.
+  if (irValue >= 7000 && count >= WAVE_BUF_SIZE / 2) {
+    uint64_t sum = 0;
+    for (int i = 0; i < count; i++) {
+      int idx = bufFilled ? (bufWriteIdx + i) % WAVE_BUF_SIZE : i;
+      sum += rawBuf[idx];
     }
+    long mean = (long)(sum / count);
+    long ac = -(irValue - mean);  // inverted: rises when heart beats
+
+    // Peak detection: when signal was rising and is now falling, we passed a peak.
+    // Only register a beat if the peak was meaningfully above the midline and
+    // enough time has passed since the last beat.
+    if (pdRising && ac < pdPrevAC) {
+      // Just passed a peak — pdPeakVal holds the peak height
+      long range = 0;
+      long rMin = 0, rMax = 0;
+      for (int i = 0; i < count; i++) {
+        int idx = bufFilled ? (bufWriteIdx + i) % WAVE_BUF_SIZE : i;
+        long v = -(long)((long)rawBuf[idx] - mean);
+        if (v < rMin) rMin = v;
+        if (v > rMax) rMax = v;
+      }
+      range = rMax - rMin;
+
+      // Only count as a beat if peak is in the upper 30% of the signal range
+      if (range > 10 && pdPeakVal > (rMin + range * 7 / 10)) {
+        long now = millis();
+        if (now - pdLastBeat > PD_MIN_INTERVAL) {
+          long delta = now - pdLastBeat;
+          pdLastBeat = now;
+
+          if (delta > 0) {
+            float bpm = 60000.0f / delta;
+            if (bpm > 20 && bpm < 255) {
+              rates[rateSpot++] = (byte)bpm;
+              rateSpot %= RATE_SIZE;
+              if (samplesCollected < RATE_SIZE) samplesCollected++;
+              beatAvg = 0;
+              for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
+              beatAvg /= RATE_SIZE;
+            }
+          }
+        }
+      }
+      pdRising = false;
+    } else if (ac > pdPrevAC) {
+      pdRising = true;
+      pdPeakVal = ac;
+    }
+    if (pdRising && ac > pdPeakVal) pdPeakVal = ac;
+    pdPrevAC = ac;
   }
 
   // --- Draw ---
@@ -191,15 +206,8 @@ void loop() {
     display.setCursor(30, 50);
     display.println(F("sensor..."));
   } else {
-    // Store raw IR reading in circular buffer
-    rawBuf[bufWriteIdx] = (uint32_t)irValue;
-    bufWriteIdx = (bufWriteIdx + 1) % WAVE_BUF_SIZE;
-    if (!bufFilled && bufWriteIdx == 0) bufFilled = true;
-
-    int count = bufFilled ? WAVE_BUF_SIZE : bufWriteIdx;
-
     if (count >= 2) {
-      // Compute buffer mean (= DC baseline) using 64-bit sum to avoid overflow
+      // Compute buffer mean for display scaling
       uint64_t sum = 0;
       for (int i = 0; i < count; i++) {
         int idx = bufFilled ? (bufWriteIdx + i) % WAVE_BUF_SIZE : i;
