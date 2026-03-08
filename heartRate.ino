@@ -48,6 +48,11 @@ bool  dcInit = false;
 long  acMin = 0;
 long  acMax = 0;
 
+// Calibration warmup: run the EMA at fast alpha before drawing so the baseline
+// snaps to the correct level before any waveform is shown.
+#define DC_WARMUP_SAMPLES 60   // ~1.2s at 50Hz
+int dcWarmup = 0;
+
 bool initSensor() {
   Wire.begin(21, 22);
   if (particleSensor.begin(Wire, I2C_SPEED_FAST)) return true;
@@ -56,25 +61,9 @@ bool initSensor() {
   return particleSensor.begin(Wire, I2C_SPEED_STANDARD);
 }
 
-// Maps an IR value into a waveform Y offset (0 = top, WAVE_HEIGHT-1 = bottom).
-//
-// Uses DC removal: a slow EMA tracks the absolute IR baseline so the large
-// constant signal level is subtracted out. Only the small AC pulse variation
-// (~1000-3000 units) is scaled to fill the display height.
-uint8_t irToWaveY(long irValue) {
-  if (!dcInit) {
-    irDC = (float)irValue;
-    dcInit = true;
-    return WAVE_HEIGHT / 2;
-  }
-
-  // Slow EMA for the DC baseline (alpha=0.05 → ~20 sample time constant)
-  irDC = irDC * 0.95f + (float)irValue * 0.05f;
-
-  // AC component: just the pulse variation around the baseline
-  long ac = irValue - (long)irDC;
-
-  // Track AC range; slowly decay toward zero so scale stays tight
+// Maps a pre-computed AC value (irValue - irDC) into a waveform Y offset.
+// Auto-scales using a decaying AC min/max so the pulse fills the display.
+uint8_t acToWaveY(long ac) {
   if (ac > acMax) acMax = ac;
   else            acMax = (long)(acMax * 0.999f);
 
@@ -82,7 +71,7 @@ uint8_t irToWaveY(long irValue) {
   else            acMin = (long)(acMin * 0.999f);
 
   long range = acMax - acMin;
-  if (range < 50) return WAVE_HEIGHT / 2;  // flat line until signal stabilises
+  if (range < 50) return WAVE_HEIGHT / 2;
 
   long mapped = map(ac, acMin, acMax, WAVE_HEIGHT - 1, 0);  // invert so peaks go up
   return (uint8_t)constrain(mapped, 0, WAVE_HEIGHT - 1);
@@ -97,6 +86,7 @@ void resetMeasurement() {
   memset(waveBuffer, WAVE_HEIGHT / 2, sizeof(waveBuffer));
   irDC = 0;
   dcInit = false;
+  dcWarmup = 0;
   acMin = 0;
   acMax = 0;
 }
@@ -185,25 +175,48 @@ void loop() {
     display.setCursor(30, 50);
     display.println(F("sensor..."));
   } else {
-    // Scroll waveform left and push the latest IR sample on the right
-    memmove(waveBuffer, waveBuffer + 1, SCREEN_WIDTH - 1);
-    waveBuffer[SCREEN_WIDTH - 1] = irToWaveY(irValue);
-
-    // Draw the waveform as connected line segments
-    for (int x = 0; x < SCREEN_WIDTH - 1; x++) {
-      display.drawLine(x,     WAVE_Y_START + waveBuffer[x],
-                       x + 1, WAVE_Y_START + waveBuffer[x + 1],
-                       SSD1306_WHITE);
+    // Update DC baseline.
+    // Fast alpha during warmup snaps to the real baseline before any waveform is shown,
+    // preventing the large startup swing caused by the finger placement transient.
+    if (!dcInit) {
+      irDC = (float)irValue;
+      dcInit = true;
+    } else if (dcWarmup < DC_WARMUP_SAMPLES) {
+      irDC = irDC * 0.5f + (float)irValue * 0.5f;  // fast: snaps to baseline in ~6 samples
+      dcWarmup++;
+    } else {
+      irDC = irDC * 0.95f + (float)irValue * 0.05f;  // slow: tracks gentle drift only
     }
 
-    // Footer separator + BPM (only shown once enough samples are collected)
-    display.drawLine(0, WAVE_Y_END + 1, SCREEN_WIDTH - 1, WAVE_Y_END + 1, SSD1306_WHITE);
-    display.setCursor(0, WAVE_Y_END + 3);
-    if (samplesCollected < RATE_SIZE) {
-      display.print(F("BPM: Measuring..."));
+    if (dcWarmup < DC_WARMUP_SAMPLES) {
+      // Show a calibration progress bar while the baseline settles
+      display.setCursor(20, 22);
+      display.println(F("Hold still..."));
+      int barWidth = (dcWarmup * (SCREEN_WIDTH - 4)) / DC_WARMUP_SAMPLES;
+      display.drawRect(2, 36, SCREEN_WIDTH - 4, 10, SSD1306_WHITE);
+      display.fillRect(2, 36, barWidth, 10, SSD1306_WHITE);
     } else {
-      display.print(F("BPM: "));
-      display.print(beatAvg);
+      // Compute AC component and scroll waveform
+      long ac = irValue - (long)irDC;
+      memmove(waveBuffer, waveBuffer + 1, SCREEN_WIDTH - 1);
+      waveBuffer[SCREEN_WIDTH - 1] = acToWaveY(ac);
+
+      // Draw the waveform as connected line segments
+      for (int x = 0; x < SCREEN_WIDTH - 1; x++) {
+        display.drawLine(x,     WAVE_Y_START + waveBuffer[x],
+                         x + 1, WAVE_Y_START + waveBuffer[x + 1],
+                         SSD1306_WHITE);
+      }
+
+      // Footer separator + BPM (only shown once enough samples are collected)
+      display.drawLine(0, WAVE_Y_END + 1, SCREEN_WIDTH - 1, WAVE_Y_END + 1, SSD1306_WHITE);
+      display.setCursor(0, WAVE_Y_END + 3);
+      if (samplesCollected < RATE_SIZE) {
+        display.print(F("BPM: Measuring..."));
+      } else {
+        display.print(F("BPM: "));
+        display.print(beatAvg);
+      }
     }
   }
 
