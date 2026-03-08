@@ -3,11 +3,11 @@
   Hardware: ESP32 + MAX30102 + SSD1306 (128x64)
   Both MAX30102 and SSD1306 share the I2C bus on GPIO 21 (SDA) / GPIO 22 (SCL)
 
-  The MAX30102 is a PPG sensor. The raw IR signal drops when the heart beats
-  (more blood → more light absorbed → lower reading). We apply a DC-removal
-  high-pass filter, smooth with a moving average, invert the result, and
-  auto-scale per-frame so the waveform always fills the display — matching
-  the approach used by well-known open-source pulse oximeter projects.
+  Waveform approach: store raw IR readings in a circular buffer. At draw
+  time, compute the buffer mean (= DC baseline), subtract it from each
+  sample to isolate the pulse (AC component), invert (PPG drops on
+  heartbeat), and auto-scale to fill the display. No online filters
+  needed — just arithmetic on the buffered data.
 
   Libraries required:
     - SparkFun MAX3010x Pulse and Proximity Sensor Library
@@ -42,26 +42,11 @@ int beatAvg = 0;
 byte samplesCollected = 0;
 bool sensorReady = false;
 
-// --- Signal processing ---
-// DC removal high-pass filter state
-float dcW = 0;        // filter memory
-#define DC_ALPHA 0.95f // high-pass cutoff ~0.5 Hz at 50 sps — passes heartbeat, blocks DC drift
-
-// Moving average filter for noise smoothing
-#define MA_SIZE 4
-int16_t maBuffer[MA_SIZE];
-uint8_t maIndex = 0;
-bool maFilled = false;
-
-// Circular waveform buffer storing filtered+inverted values (raw int16 before display scaling)
+// Raw IR circular buffer — DC removal and scaling happen at draw time
 #define WAVE_BUF_SIZE SCREEN_WIDTH
-int16_t waveBuf[WAVE_BUF_SIZE];
-uint8_t waveWriteIdx = 0;
-bool waveFilled = false;    // true once the buffer has wrapped at least once
-
-// Warmup: skip the first N samples while the DC filter settles
-#define WARMUP_SAMPLES 50
-int warmupCount = 0;
+uint32_t rawBuf[WAVE_BUF_SIZE];
+uint8_t  bufWriteIdx = 0;
+bool     bufFilled = false;
 
 bool initSensor() {
   Wire.begin(21, 22);
@@ -71,40 +56,14 @@ bool initSensor() {
   return particleSensor.begin(Wire, I2C_SPEED_STANDARD);
 }
 
-// DC-removal high-pass filter.
-// Removes the large constant IR baseline so only the pulsatile AC component remains.
-int16_t dcRemove(long rawValue) {
-  float x = (float)rawValue;
-  float oldW = dcW;
-  dcW = x + DC_ALPHA * oldW;
-  return (int16_t)(dcW - oldW);
-}
-
-// Moving average filter — smooths high-frequency noise from the AC signal.
-int16_t maFilter(int16_t input) {
-  maBuffer[maIndex] = input;
-  maIndex = (maIndex + 1) % MA_SIZE;
-  if (!maFilled && maIndex == 0) maFilled = true;
-  int16_t count = maFilled ? MA_SIZE : maIndex;
-  if (count == 0) return input;
-  long sum = 0;
-  for (int i = 0; i < count; i++) sum += maBuffer[i];
-  return (int16_t)(sum / count);
-}
-
 void resetMeasurement() {
   rateSpot = 0;
   beatsPerMinute = 0;
   beatAvg = 0;
   samplesCollected = 0;
-  dcW = 0;
-  maIndex = 0;
-  maFilled = false;
-  memset(maBuffer, 0, sizeof(maBuffer));
-  memset(waveBuf, 0, sizeof(waveBuf));
-  waveWriteIdx = 0;
-  waveFilled = false;
-  warmupCount = 0;
+  bufWriteIdx = 0;
+  bufFilled = false;
+  memset(rawBuf, 0, sizeof(rawBuf));
 }
 
 void setup() {
@@ -118,10 +77,10 @@ void setup() {
   }
 
   if (initSensor()) {
-    // Higher LED power (0x7F = 25.4mA) for stronger signal and more reliable beat detection
-    particleSensor.setup(0x7F, 4, 2, 400, 411, 4096);
-    particleSensor.setPulseAmplitudeRed(0x7F);
-    particleSensor.setPulseAmplitudeIR(0x7F);
+    // sampleAverage=8 for cleaner signal from cheap sensors
+    particleSensor.setup(0x1F, 8, 2, 400, 411, 4096);
+    particleSensor.setPulseAmplitudeRed(0x1F);
+    particleSensor.setPulseAmplitudeIR(0x1F);
     particleSensor.setPulseAmplitudeGreen(0);
     sensorReady = true;
   }
@@ -143,9 +102,9 @@ void loop() {
     delay(2000);
 
     if (initSensor()) {
-      particleSensor.setup(0x7F, 4, 2, 400, 411, 4096);
-      particleSensor.setPulseAmplitudeRed(0x7F);
-      particleSensor.setPulseAmplitudeIR(0x7F);
+      particleSensor.setup(0x1F, 8, 2, 400, 411, 4096);
+      particleSensor.setPulseAmplitudeRed(0x1F);
+      particleSensor.setPulseAmplitudeIR(0x1F);
       particleSensor.setPulseAmplitudeGreen(0);
       resetMeasurement();
       sensorReady = true;
@@ -173,21 +132,6 @@ void loop() {
     }
   }
 
-  // --- Signal processing for waveform ---
-  int16_t dcFiltered = dcRemove(irValue);
-  int16_t smoothed = maFilter(dcFiltered);
-  // Invert: PPG drops during a heartbeat, inverting gives upward peaks
-  int16_t inverted = -smoothed;
-
-  // Let the DC filter settle before recording to the wave buffer
-  if (warmupCount < WARMUP_SAMPLES) {
-    warmupCount++;
-  } else {
-    waveBuf[waveWriteIdx] = inverted;
-    waveWriteIdx = (waveWriteIdx + 1) % WAVE_BUF_SIZE;
-    if (!waveFilled && waveWriteIdx == 0) waveFilled = true;
-  }
-
   // --- Draw ---
   display.clearDisplay();
   display.setTextSize(1);
@@ -204,49 +148,62 @@ void loop() {
     display.println(F("Place finger on"));
     display.setCursor(30, 50);
     display.println(F("sensor..."));
-  } else if (warmupCount < WARMUP_SAMPLES) {
-    display.setCursor(20, 28);
-    display.println(F("Calibrating..."));
   } else {
-    // Read the circular buffer in display order (oldest → newest, left → right)
-    int count = waveFilled ? WAVE_BUF_SIZE : waveWriteIdx;
-    if (count < 2) { display.display(); delay(20); return; }
+    // Store raw IR reading in circular buffer
+    rawBuf[bufWriteIdx] = (uint32_t)irValue;
+    bufWriteIdx = (bufWriteIdx + 1) % WAVE_BUF_SIZE;
+    if (!bufFilled && bufWriteIdx == 0) bufFilled = true;
 
-    // Per-frame auto-scaling: find min/max across the entire visible buffer
-    int16_t vMin = 32767, vMax = -32768;
-    for (int i = 0; i < count; i++) {
-      int idx = waveFilled ? (waveWriteIdx + i) % WAVE_BUF_SIZE : i;
-      if (waveBuf[idx] < vMin) vMin = waveBuf[idx];
-      if (waveBuf[idx] > vMax) vMax = waveBuf[idx];
-    }
+    int count = bufFilled ? WAVE_BUF_SIZE : bufWriteIdx;
 
-    int16_t range = vMax - vMin;
-    if (range < 10) range = 10;  // avoid divide-by-zero when signal is flat
-
-    // Map each sample to a display Y coordinate
-    int xOffset = SCREEN_WIDTH - count;  // right-justify if buffer not full yet
-    int prevY = -1;
-    for (int i = 0; i < count; i++) {
-      int idx = waveFilled ? (waveWriteIdx + i) % WAVE_BUF_SIZE : i;
-      // Scale to display: vMax→top (WAVE_Y_START), vMin→bottom (WAVE_Y_END-1)
-      int y = WAVE_Y_END - 1 - (int)((long)(waveBuf[idx] - vMin) * (WAVE_HEIGHT - 1) / range);
-      y = constrain(y, WAVE_Y_START, WAVE_Y_END - 1);
-
-      int x = xOffset + i;
-      if (prevY >= 0 && i > 0) {
-        display.drawLine(x - 1, prevY, x, y, SSD1306_WHITE);
+    if (count >= 2) {
+      // Compute buffer mean (= DC baseline) using 64-bit sum to avoid overflow
+      uint64_t sum = 0;
+      for (int i = 0; i < count; i++) {
+        int idx = bufFilled ? (bufWriteIdx + i) % WAVE_BUF_SIZE : i;
+        sum += rawBuf[idx];
       }
-      prevY = y;
-    }
+      long mean = (long)(sum / count);
 
-    // Footer
-    display.drawLine(0, WAVE_Y_END + 1, SCREEN_WIDTH - 1, WAVE_Y_END + 1, SSD1306_WHITE);
-    display.setCursor(0, WAVE_Y_END + 3);
-    if (samplesCollected < RATE_SIZE) {
-      display.print(F("BPM: Measuring..."));
-    } else {
-      display.print(F("BPM: "));
-      display.print(beatAvg);
+      // Compute AC values: subtract mean, then invert (PPG drops on heartbeat)
+      // Find min/max of inverted AC for auto-scaling
+      long acMin = 0, acMax = 0;
+      for (int i = 0; i < count; i++) {
+        int idx = bufFilled ? (bufWriteIdx + i) % WAVE_BUF_SIZE : i;
+        long ac = -(long)((long)rawBuf[idx] - mean);  // inverted
+        if (ac < acMin) acMin = ac;
+        if (ac > acMax) acMax = ac;
+      }
+
+      long range = acMax - acMin;
+      if (range < 10) range = 10;
+
+      // Draw waveform: map each AC value to display coordinates
+      int xOffset = SCREEN_WIDTH - count;
+      int prevY = -1;
+      for (int i = 0; i < count; i++) {
+        int idx = bufFilled ? (bufWriteIdx + i) % WAVE_BUF_SIZE : i;
+        long ac = -(long)((long)rawBuf[idx] - mean);
+
+        int y = WAVE_Y_END - 1 - (int)((ac - acMin) * (WAVE_HEIGHT - 1) / range);
+        y = constrain(y, WAVE_Y_START, WAVE_Y_END - 1);
+
+        int x = xOffset + i;
+        if (prevY >= 0 && i > 0) {
+          display.drawLine(x - 1, prevY, x, y, SSD1306_WHITE);
+        }
+        prevY = y;
+      }
+
+      // Footer
+      display.drawLine(0, WAVE_Y_END + 1, SCREEN_WIDTH - 1, WAVE_Y_END + 1, SSD1306_WHITE);
+      display.setCursor(0, WAVE_Y_END + 3);
+      if (samplesCollected < RATE_SIZE) {
+        display.print(F("BPM: Measuring..."));
+      } else {
+        display.print(F("BPM: "));
+        display.print(beatAvg);
+      }
     }
   }
 
