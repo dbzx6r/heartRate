@@ -185,7 +185,7 @@ void loop() {
       irDC = irDC * 0.5f + (float)irValue * 0.5f;  // fast: snaps to baseline in ~6 samples
       dcWarmup++;
     } else {
-      irDC = irDC * 0.95f + (float)irValue * 0.05f;  // slow: tracks gentle drift only
+      irDC = irDC * 0.995f + (float)irValue * 0.005f;  // slow: time constant ~4s, won't track the pulse
     }
 
     if (dcWarmup < DC_WARMUP_SAMPLES) {
