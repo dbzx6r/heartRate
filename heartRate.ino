@@ -41,10 +41,12 @@ bool sensorReady = false;
 // Scrolling waveform buffer (one Y value per pixel column)
 uint8_t waveBuffer[SCREEN_WIDTH];
 
-// Auto-scaling: tracks IR signal range to fill the waveform height.
-// irMin starts high and irMax starts low so both get replaced on the first real reading.
-long irMin = 300000;
-long irMax = 0;
+// DC removal: slow EMA tracks the baseline IR level so only the pulse variation is displayed.
+// AC min/max auto-scale the pulse amplitude to fill the waveform height.
+float irDC = 0;
+bool  dcInit = false;
+long  acMin = 0;
+long  acMax = 0;
 
 bool initSensor() {
   Wire.begin(21, 22);
@@ -55,13 +57,34 @@ bool initSensor() {
 }
 
 // Maps an IR value into a waveform Y offset (0 = top, WAVE_HEIGHT-1 = bottom).
-// Updates running min/max for auto-scaling so the pulse fills the display.
+//
+// Uses DC removal: a slow EMA tracks the absolute IR baseline so the large
+// constant signal level is subtracted out. Only the small AC pulse variation
+// (~1000-3000 units) is scaled to fill the display height.
 uint8_t irToWaveY(long irValue) {
-  if (irValue < irMin) irMin = irValue;
-  if (irValue > irMax) irMax = irValue;
-  long range = irMax - irMin;
-  if (range < 500) return WAVE_HEIGHT / 2;  // flat line until signal stabilises
-  long mapped = map(irValue, irMin, irMax, WAVE_HEIGHT - 1, 0);  // invert so peaks go up
+  if (!dcInit) {
+    irDC = (float)irValue;
+    dcInit = true;
+    return WAVE_HEIGHT / 2;
+  }
+
+  // Slow EMA for the DC baseline (alpha=0.05 → ~20 sample time constant)
+  irDC = irDC * 0.95f + (float)irValue * 0.05f;
+
+  // AC component: just the pulse variation around the baseline
+  long ac = irValue - (long)irDC;
+
+  // Track AC range; slowly decay toward zero so scale stays tight
+  if (ac > acMax) acMax = ac;
+  else            acMax = (long)(acMax * 0.999f);
+
+  if (ac < acMin) acMin = ac;
+  else            acMin = (long)(acMin * 0.999f);
+
+  long range = acMax - acMin;
+  if (range < 50) return WAVE_HEIGHT / 2;  // flat line until signal stabilises
+
+  long mapped = map(ac, acMin, acMax, WAVE_HEIGHT - 1, 0);  // invert so peaks go up
   return (uint8_t)constrain(mapped, 0, WAVE_HEIGHT - 1);
 }
 
@@ -72,8 +95,10 @@ void resetMeasurement() {
   samplesCollected = 0;
   memset(rates, 0, sizeof(rates));
   memset(waveBuffer, WAVE_HEIGHT / 2, sizeof(waveBuffer));
-  irMin = 300000;
-  irMax = 0;
+  irDC = 0;
+  dcInit = false;
+  acMin = 0;
+  acMax = 0;
 }
 
 void setup() {
